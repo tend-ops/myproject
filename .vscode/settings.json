@@ -1,0 +1,4 @@
+{
+   "smartCodeReview.ai.serverUrl": "http://localhost:11434/api/generate",
+"smartCodeReview.ai.maxTokens": 2048
+}

@@ -1,0 +1,194 @@
+{
+  "name": "smart-code-review-vscode",
+  "displayName": "Smart Code Review",
+  "description": "基于 Tree-sitter、Pylint/ESLint/Checkstyle 和 CodeLlama-7B-Instruct 等开源模型的智能代码审查与优化助手，覆盖语法检测—规范校验—安全与性能—重构建议。",
+  "version": "0.1.0",
+  "publisher": "your-name",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:java",
+    "onCommand:smartCodeReview.runFullReview",
+    "onCommand:smartCodeReview.runSmartAnalysis",
+    "onCommand:smartCodeReview.pickFileAndReview",
+    "onCommand:smartCodeReview.generateFixedCode",
+    "onView:smartCodeReviewView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "smartCodeReview.runFullReview",
+        "title": "Smart Code Review: 全流程审查",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.runSmartAnalysis",
+        "title": "Smart Code Review: 智能分析（仅模型）",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.showReviewPanel",
+        "title": "Smart Code Review: 显示审查结果面板",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.refreshReviewView",
+        "title": "Smart Code Review: 刷新审查视图",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.revealIssue",
+        "title": "Smart Code Review: 定位到问题行",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.pickFileAndReview",
+        "title": "Smart Code Review: 选择文件并全流程审查",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.generateFixedCode",
+        "title": "Smart Code Review: 生成修复后代码",
+        "category": "Smart Code Review"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "smartCodeReview",
+          "title": "Smart Code Review",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "smartCodeReview": [
+        {
+          "id": "smartCodeReviewView",
+          "name": "审查结果"
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "title": "Smart Code Review 配置",
+      "properties": {
+        "smartCodeReview.enableTreeSitter": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 Tree-sitter 语法解析与中间表示提取。"
+        },
+        "smartCodeReview.lint.enablePylint": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 Pylint 规则校验。"
+        },
+        "smartCodeReview.lint.enableEslint": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 ESLint 规则校验。"
+        },
+        "smartCodeReview.lint.enableCheckstyle": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 Checkstyle（Java）规则校验。"
+        },
+        "smartCodeReview.lint.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "运行 Pylint 的 Python 解释器路径。"
+        },
+        "smartCodeReview.lint.pylintPath": {
+          "type": "string",
+          "default": "pylint",
+          "description": "Pylint 模块/可执行文件路径。"
+        },
+        "smartCodeReview.lint.eslintPath": {
+          "type": "string",
+          "default": "eslint",
+          "description": "ESLint 可执行文件路径。"
+        },
+        "smartCodeReview.lint.checkstylePath": {
+          "type": "string",
+          "default": "",
+          "description": "Checkstyle 可执行文件路径。"
+        },
+        "smartCodeReview.lint.checkstyleJar": {
+          "type": "string",
+          "default": "",
+          "description": "Checkstyle JAR 路径（使用 java -jar 调用）。"
+        },
+        "smartCodeReview.ai.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:11434/api/generate",
+          "description": "CodeLlama-7B-Instruct 等模型的 HTTP 接口地址（POST）。"
+        },
+        "smartCodeReview.ai.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "调用 AI 服务的 API Key（可选）。"
+        },
+        "smartCodeReview.ai.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "description": "AI 返回最大 token 数。"
+        },
+        "smartCodeReview.ai.autoTriggerOnHighRisk": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅当规则检测到高风险问题时自动触发模型分析（否则全流程审查时始终调用模型）。"
+        },
+        "smartCodeReview.rules.enableBuiltin": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用内置规则（安全、性能、重构）。"
+        },
+        "smartCodeReview.rules.priority": {
+          "type": "object",
+          "default": {
+            "security": 100,
+            "performance": 80,
+            "refactor": 60,
+            "style": 40,
+            "syntax": 120
+          },
+          "description": "规则类别优先级（数值越大优先级越高）。"
+        },
+        "smartCodeReview.rules.custom": {
+          "type": "array",
+          "default": [],
+          "description": "自定义规则配置。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "echo \"No tests yet\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "eslint": "^8.57.1",
+    "typescript": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "tree-sitter": "^0.20.6",
+    "tree-sitter-java": "^0.20.2",
+    "tree-sitter-javascript": "^0.20.4",
+    "tree-sitter-python": "^0.20.4"
+  }
+}

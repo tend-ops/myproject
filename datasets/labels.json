@@ -1,0 +1,74 @@
+{
+  "python/normal/good_code.py": {
+    "syntax_error_type": null,
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "python/syntax_error/broken_indent.py": {
+    "syntax_error_type": "indent_error",
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "python/style_violation/bad_naming.py": {
+    "syntax_error_type": null,
+    "norm_violation": ["naming"],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "python/security/eval_usage.py": {
+    "syntax_error_type": null,
+    "norm_violation": ["eval-used"],
+    "vulnerability_level": "high",
+    "for_model_tuning": true
+  },
+  "javascript/normal/good_code.js": {
+    "syntax_error_type": null,
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "javascript/syntax_error/missing_semicolon.js": {
+    "syntax_error_type": "syntax_error",
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "javascript/style_violation/undeclared_var.js": {
+    "syntax_error_type": null,
+    "norm_violation": ["no-undef"],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "javascript/security/eval_usage.js": {
+    "syntax_error_type": null,
+    "norm_violation": ["no-eval"],
+    "vulnerability_level": "high",
+    "for_model_tuning": true
+  },
+  "java/normal/GoodCode.java": {
+    "syntax_error_type": null,
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "java/syntax_error/MissingSemicolon.java": {
+    "syntax_error_type": "syntax_error",
+    "norm_violation": [],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "java/style_violation/BadNaming.java": {
+    "syntax_error_type": null,
+    "norm_violation": ["naming"],
+    "vulnerability_level": null,
+    "for_model_tuning": true
+  },
+  "java/security/SqlInjection.java": {
+    "syntax_error_type": null,
+    "norm_violation": ["security"],
+    "vulnerability_level": "high",
+    "for_model_tuning": true
+  }
+}
