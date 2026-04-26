@@ -1,0 +1,15 @@
+%!TEX root = ../sztuthesis_main.tex
+
+\addcontentsline{toc}{section}{Abstract}
+
+\keywordsen{Intelligent Code Review；LLM；RAG；Agent}
+\categoryen{TP391}
+\begin{abstracten}
+As software development scales and grows more complex, code quality and security have become critical to project success. Traditional code review, relying on manual experience, suffers from low efficiency and incomplete coverage, failing to meet the rapid iteration needs of modern software. To address this, this paper designs and implements an intelligent code review VS Code extension system based on Large Language Models (LLMs) and Retrieval-Augmented Generation (RAG), aiming to boost review automation and accuracy.
+
+The system adopts a front-end/back-end architecture: the VS Code extension handles user interaction and triggers analysis, while a back-end Agent service integrates static analysis tools, Tree-sitter parsers, and the CodeLlama LLM to enable multi-dimensional review and intelligent repair. Core features include rule-AI hybrid review, real-time and batch review, intelligent code repair suggestions, and RAG-powered context-enhanced analysis.
+
+During implementation, the system integrates code analysis tools (e.g., Pylint, ESLint) and vector databases (ChromaDB). It uses RAG to enhance the LLM’s code context understanding and introduces a reflection mechanism to optimize review results. Tests show the system effectively identifies security vulnerabilities, performance issues, and style defects, with generated repair code maintaining original functionality while significantly improving quality.
+
+This research validates the value of LLMs and RAG in code review, providing developers with an efficient, intelligent tool for code quality assurance. Future work will expand support for more programming languages and optimize model inference speed to further enhance the system’s practicality and universality.
+\end{abstracten}
