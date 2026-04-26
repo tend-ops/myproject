@@ -162,6 +162,5 @@ export function runRefactorRules(
     }
   }
 
-  console.log('Refactor items found:', items.length);
   return items;
 }

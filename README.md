@@ -114,6 +114,15 @@ smart-code-review-vscode/
    - **Python**：`pip install pylint` 或 `py -m pip install pylint`，保证命令行可执行 `pylint --version`。  
    - **JavaScript/TypeScript**：在待审查项目或本插件目录执行 `npm install -g eslint`，或项目内 `npm install eslint` 并配置好 `eslintPath`。  
    - **Java**：若需 Checkstyle，下载 Checkstyle JAR，在设置中填写 `smartCodeReview.lint.checkstyleJar`。
+3. **（可选）Python AI Agent 服务**  
+   本项目新增了一个独立的 Python 进程，用以承载 AI Agent 智能管控逻辑。既可在本机启动，也可部署到远端：  
+   - 进入 `review_agent` 子目录，创建并激活虚拟环境（例如 `python -m venv .venv && .\.venv\Scripts\activate`）。
+   - 安装依赖：`pip install -r requirements.txt`。  
+   - 启动服务：`uvicorn server:app --host 0.0.0.0 --port 5000`。  
+   - 默认提供 `POST /review` 接口，接受与 `agentClient.AgentReviewInput` 对应的 JSON，返回与 `FileReviewResult` 一致的结构。  
+   - 在 VS Code 插件设置中配置 `smartCodeReview.agent.serverUrl` 为如 `http://localhost:5000/review`，即可将审查请求委托给该 Agent。  
+   - 服务内部同时支持 Tree-sitter 解析、Pylint/ESLint 调用，以及基于 **LangChain 框架**的 AI 模型推理；若未安装或出现错误，Agent 会回退到本地 TS 逻辑。  
+   - LangChain 集成提供了结构化提示、链式执行和灵活的模型支持，使 AI 分析更加专业和可扩展。  
 
 3. **（可选）AI 服务**  
    若使用「全流程审查」或「智能分析」且希望调用模型，需先在本机或服务器部署符合接口约定的 CodeLlama 服务（如通过 Ollama、vLLM 等），并配置 `smartCodeReview.ai.serverUrl`。不配置时插件仍可运行，仅 AI 部分会提示连接失败。

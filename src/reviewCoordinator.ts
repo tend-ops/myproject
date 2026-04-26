@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { treeSitterService } from './treeSitterService';
 import { runLinters, hasHighRiskIssues } from './lintRunner';
 import { requestAiReview } from './aiClient';
+import { requestAgentReview, checkAgentStatus } from './agentClient';
 import { getCodeSnippetAtLine } from './astExtract';
 import { setCachedResult } from './resultCache';
 import { runSecurityRules, runPerformanceRules, runRefactorRules } from './builtinRules';
@@ -26,6 +27,98 @@ let lastReviewResult: FileReviewResult | null = null;
 
 export function getLastReviewResult(): FileReviewResult | null {
   return lastReviewResult;
+}
+
+/**
+ * 处理Agent结果并更新诊断信息
+ */
+async function handleAgentResult(document: vscode.TextDocument, context: vscode.ExtensionContext, agentResult: any, output?: vscode.OutputChannel): Promise<boolean> {
+  if (!agentResult) return false;
+  
+  // 将 agentResult 中的 issues 转为 Diagnostics
+  const diagnostics: vscode.Diagnostic[] = [];
+  for (const item of agentResult.issues) {
+    if (item.line > 0) {
+      const line = Math.max(0, item.line - 1);
+      const range = new vscode.Range(line, 0, line, 256);
+      const severity = 
+        item.severity === 'error' ? vscode.DiagnosticSeverity.Error
+        : item.severity === 'warning' ? vscode.DiagnosticSeverity.Warning
+        : vscode.DiagnosticSeverity.Information;
+      diagnostics.push(new vscode.Diagnostic(range, item.message, severity));
+    }
+  }
+  diagnosticCollection.set(document.uri, diagnostics);
+
+  // 构建FileReviewResult格式
+  const result: FileReviewResult = {
+    uri: document.uri.toString(),
+    filePath: document.fileName,
+    contentHash: '',
+    timestamp: Date.now(),
+    ir: null,
+    ruleIssues: [],
+    aiResult: null,
+    mergedItems: agentResult.issues.map((issue: { category: string; line: number; message: string; severity: string }) => ({
+      id: `agent-${issue.category}-${issue.line}-${issue.message.slice(0, 30)}`,
+      source: 'agent',
+      category: issue.category,
+      message: issue.message,
+      severity: issue.severity,
+      line: issue.line,
+      column: 0
+    }))
+  };
+
+  lastReviewResult = result;
+  setCachedResult(context, result);
+  await vscode.commands.executeCommand('smartCodeReview.refreshReviewView');
+  await vscode.commands.executeCommand('workbench.view.extension.smartCodeReview');
+  
+  if (output) {
+    output.appendLine('=== Agent 审查完成 ===');
+    if (agentResult.execution_time) {
+      output.appendLine(`[Agent] 执行时间: ${agentResult.execution_time.total.toFixed(2)}ms`);
+    }
+    output.appendLine(`[Agent] 发现问题: ${agentResult.issues.length} 个`);
+    if (agentResult.summary && agentResult.summary.by_category) {
+      for (const category in agentResult.summary.by_category) {
+        output.appendLine(`  ${category}: ${agentResult.summary.by_category[category]}`);
+      }
+    }
+  }
+  
+  return true;
+}
+
+/**
+ * 检查Agent状态并处理请求
+ */
+async function checkAndHandleAgent(document: vscode.TextDocument, context: vscode.ExtensionContext, output?: vscode.OutputChannel): Promise<boolean> {
+  const agentUrl = vscode.workspace.getConfiguration('smartCodeReview.agent').get<string>('serverUrl', '');
+  if (!agentUrl) return false;
+  
+  if (output) {
+    output.appendLine('[Agent] 使用 Review Agent 进行全流程审查...');
+  }
+  
+  const agentStatus = await checkAgentStatus();
+  if (!agentStatus) {
+    if (output) {
+      output.appendLine('[Agent] 服务不可用，回退到本地逻辑');
+    }
+    return false;
+  }
+  
+  const agentResult = await requestAgentReview(document, [], [], null);
+  if (!agentResult) {
+    if (output) {
+      output.appendLine('[Agent] 请求失败，回退到本地逻辑');
+    }
+    return false;
+  }
+  
+  return await handleAgentResult(document, context, agentResult, output);
 }
 
 /** 将 Linter 的 RuleIssue 转为 MergedReviewItem（规范 vs 安全） */
@@ -110,6 +203,10 @@ export async function runRuleCheckOnly(
   document: vscode.TextDocument,
   context: vscode.ExtensionContext
 ): Promise<{ ruleIssues: RuleIssue[]; ir: CodeIntermediateRepresentation | null }> {
+  if (await checkAndHandleAgent(document, context)) {
+    return { ruleIssues: [], ir: null };
+  }
+
   const parseResult = treeSitterService.parse(document);
   const ir = parseResult.ir;
   const syntaxErrors = parseResult.errors ?? [];
@@ -206,14 +303,22 @@ export async function runSmartAnalysisOnly(
   output.show(true);
   output.appendLine('[智能分析] 正在准备输入（裁剪代码 + 上下文）...');
 
+  if (await checkAndHandleAgent(document, context, output)) {
+    output.appendLine('[智能分析] 由 Agent 完成');
+    output.appendLine(`[智能分析] 发现 ${lastReviewResult?.mergedItems.length || 0} 个问题`);
+    lastReviewResult?.mergedItems.forEach((issue: { category: string; message: string }) => output.appendLine(`  [${issue.category}] ${issue.message}`));
+    return;
+  }
+
+  const code = document.getText();
+
   const parseResult = treeSitterService.parse(document);
   const ir = parseResult.ir;
   const ruleIssues = await runLinters(document);
   const cursorLine = options?.cursorLine ?? vscode.window.activeTextEditor?.selection.active.line ?? 0;
-  const code = document.getText();
-  const codeSnippet = ir ? getCodeSnippetAtLine(ir, code, cursorLine) : code.slice(0, 8000);
+  const codeSnippet = ir ? getCodeSnippetAtLine(ir, document.getText(), cursorLine) : document.getText().slice(0, 8000);
   const contextSummary = ir
-    ? `函数: ${ir.functions.map(f => f.name).join(', ')}; 变量: ${ir.variables.slice(0, 20).map(v => v.name).join(', ')}`
+    ? `函数: ${ir.functions.map(f => f.name).join(', ')}; 变量: ${ir.variables.slice(0,20).map(v => v.name).join(', ')}`
     : '';
 
   const aiResult = await requestAiReview({
@@ -281,6 +386,10 @@ export async function runFullReview(
   output.appendLine('=== Smart Code Review 全流程审查 ===');
   output.appendLine('流程：语法错误检测 → 代码规范校验 → 安全漏洞识别 → 性能优化建议 → 重构方案生成');
   output.appendLine('');
+
+  if (await checkAndHandleAgent(document, context, output)) {
+    return;
+  }
 
   const code = document.getText();
 

@@ -46,6 +46,7 @@ const vscode = __importStar(require("vscode"));
 const treeSitterService_1 = require("./treeSitterService");
 const lintRunner_1 = require("./lintRunner");
 const aiClient_1 = require("./aiClient");
+const agentClient_1 = require("./agentClient");
 const astExtract_1 = require("./astExtract");
 const resultCache_1 = require("./resultCache");
 const builtinRules_1 = require("./builtinRules");
@@ -56,6 +57,88 @@ exports.diagnosticCollection = diagnosticCollection;
 let lastReviewResult = null;
 function getLastReviewResult() {
     return lastReviewResult;
+}
+/**
+ * 处理Agent结果并更新诊断信息
+ */
+async function handleAgentResult(document, context, agentResult, output) {
+    if (!agentResult)
+        return false;
+    // 将 agentResult 中的 issues 转为 Diagnostics
+    const diagnostics = [];
+    for (const item of agentResult.issues) {
+        if (item.line > 0) {
+            const line = Math.max(0, item.line - 1);
+            const range = new vscode.Range(line, 0, line, 256);
+            const severity = item.severity === 'error' ? vscode.DiagnosticSeverity.Error
+                : item.severity === 'warning' ? vscode.DiagnosticSeverity.Warning
+                    : vscode.DiagnosticSeverity.Information;
+            diagnostics.push(new vscode.Diagnostic(range, item.message, severity));
+        }
+    }
+    diagnosticCollection.set(document.uri, diagnostics);
+    // 构建FileReviewResult格式
+    const result = {
+        uri: document.uri.toString(),
+        filePath: document.fileName,
+        contentHash: '',
+        timestamp: Date.now(),
+        ir: null,
+        ruleIssues: [],
+        aiResult: null,
+        mergedItems: agentResult.issues.map((issue) => ({
+            id: `agent-${issue.category}-${issue.line}-${issue.message.slice(0, 30)}`,
+            source: 'agent',
+            category: issue.category,
+            message: issue.message,
+            severity: issue.severity,
+            line: issue.line,
+            column: 0
+        }))
+    };
+    lastReviewResult = result;
+    (0, resultCache_1.setCachedResult)(context, result);
+    await vscode.commands.executeCommand('smartCodeReview.refreshReviewView');
+    await vscode.commands.executeCommand('workbench.view.extension.smartCodeReview');
+    if (output) {
+        output.appendLine('=== Agent 审查完成 ===');
+        if (agentResult.execution_time) {
+            output.appendLine(`[Agent] 执行时间: ${agentResult.execution_time.total.toFixed(2)}ms`);
+        }
+        output.appendLine(`[Agent] 发现问题: ${agentResult.issues.length} 个`);
+        if (agentResult.summary && agentResult.summary.by_category) {
+            for (const category in agentResult.summary.by_category) {
+                output.appendLine(`  ${category}: ${agentResult.summary.by_category[category]}`);
+            }
+        }
+    }
+    return true;
+}
+/**
+ * 检查Agent状态并处理请求
+ */
+async function checkAndHandleAgent(document, context, output) {
+    const agentUrl = vscode.workspace.getConfiguration('smartCodeReview.agent').get('serverUrl', '');
+    if (!agentUrl)
+        return false;
+    if (output) {
+        output.appendLine('[Agent] 使用 Review Agent 进行全流程审查...');
+    }
+    const agentStatus = await (0, agentClient_1.checkAgentStatus)();
+    if (!agentStatus) {
+        if (output) {
+            output.appendLine('[Agent] 服务不可用，回退到本地逻辑');
+        }
+        return false;
+    }
+    const agentResult = await (0, agentClient_1.requestAgentReview)(document, [], [], null);
+    if (!agentResult) {
+        if (output) {
+            output.appendLine('[Agent] 请求失败，回退到本地逻辑');
+        }
+        return false;
+    }
+    return await handleAgentResult(document, context, agentResult, output);
 }
 /** 将 Linter 的 RuleIssue 转为 MergedReviewItem（规范 vs 安全） */
 function ruleIssuesToItems(ruleIssues) {
@@ -128,6 +211,9 @@ function mergeAllStages(syntaxItems, styleItems, securityItems, performanceItems
 }
 /** 仅运行规则校验 + 诊断展示（可被 onDidChange 等触发，异步不阻塞） */
 async function runRuleCheckOnly(document, context) {
+    if (await checkAndHandleAgent(document, context)) {
+        return { ruleIssues: [], ir: null };
+    }
     const parseResult = treeSitterService_1.treeSitterService.parse(document);
     const ir = parseResult.ir;
     const syntaxErrors = parseResult.errors ?? [];
@@ -196,12 +282,18 @@ async function runSmartAnalysisOnly(document, context, options) {
     const output = vscode.window.createOutputChannel('Smart Code Review');
     output.show(true);
     output.appendLine('[智能分析] 正在准备输入（裁剪代码 + 上下文）...');
+    if (await checkAndHandleAgent(document, context, output)) {
+        output.appendLine('[智能分析] 由 Agent 完成');
+        output.appendLine(`[智能分析] 发现 ${lastReviewResult?.mergedItems.length || 0} 个问题`);
+        lastReviewResult?.mergedItems.forEach((issue) => output.appendLine(`  [${issue.category}] ${issue.message}`));
+        return;
+    }
+    const code = document.getText();
     const parseResult = treeSitterService_1.treeSitterService.parse(document);
     const ir = parseResult.ir;
     const ruleIssues = await (0, lintRunner_1.runLinters)(document);
     const cursorLine = options?.cursorLine ?? vscode.window.activeTextEditor?.selection.active.line ?? 0;
-    const code = document.getText();
-    const codeSnippet = ir ? (0, astExtract_1.getCodeSnippetAtLine)(ir, code, cursorLine) : code.slice(0, 8000);
+    const codeSnippet = ir ? (0, astExtract_1.getCodeSnippetAtLine)(ir, document.getText(), cursorLine) : document.getText().slice(0, 8000);
     const contextSummary = ir
         ? `函数: ${ir.functions.map(f => f.name).join(', ')}; 变量: ${ir.variables.slice(0, 20).map(v => v.name).join(', ')}`
         : '';
@@ -256,6 +348,9 @@ async function runFullReview(document, context, options) {
     output.appendLine('=== Smart Code Review 全流程审查 ===');
     output.appendLine('流程：语法错误检测 → 代码规范校验 → 安全漏洞识别 → 性能优化建议 → 重构方案生成');
     output.appendLine('');
+    if (await checkAndHandleAgent(document, context, output)) {
+        return;
+    }
     const code = document.getText();
     // ——— 阶段 1：语法错误检测（Tree-sitter） ———
     output.appendLine('[1/5] 语法错误检测（Tree-sitter 解析）...');

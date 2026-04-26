@@ -21,6 +21,8 @@
     "onCommand:smartCodeReview.runSmartAnalysis",
     "onCommand:smartCodeReview.pickFileAndReview",
     "onCommand:smartCodeReview.generateFixedCode",
+    "onCommand:smartCodeReview.runBatchReview",
+    "onCommand:smartCodeReview.indexProject",
     "onView:smartCodeReviewView"
   ],
   "main": "./out/extension.js",
@@ -59,6 +61,16 @@
       {
         "command": "smartCodeReview.generateFixedCode",
         "title": "Smart Code Review: 生成修复后代码",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.runBatchReview",
+        "title": "Smart Code Review: 批量审查",
+        "category": "Smart Code Review"
+      },
+      {
+        "command": "smartCodeReview.indexProject",
+        "title": "Smart Code Review: 索引项目",
         "category": "Smart Code Review"
       }
     ],
@@ -148,6 +160,16 @@
           "default": false,
           "description": "仅当规则检测到高风险问题时自动触发模型分析（否则全流程审查时始终调用模型）。"
         },
+        "smartCodeReview.agent.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "AI Agent 服务的 HTTP 地址，例如 http://localhost:5000/review 。为空时使用本地内置逻辑。"
+        },
+        "smartCodeReview.agent.timeout": {
+          "type": "number",
+          "default": 500,
+          "description": "与 AI Agent 通信的超时时间（毫秒），用于控制单文件审查响应时长。"
+        },
         "smartCodeReview.rules.enableBuiltin": {
           "type": "boolean",
           "default": true,
@@ -177,7 +199,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "echo \"No tests yet\""
+    "test": "echo \"No tests yet\"",
+    "agent": "cd review_agent && python -m venv .venv && .venv\\Scripts\\activate && pip install -r requirements.txt && uvicorn server:app --host 0.0.0.0 --port 5000"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -189,6 +212,7 @@
     "tree-sitter": "^0.20.6",
     "tree-sitter-java": "^0.20.2",
     "tree-sitter-javascript": "^0.20.4",
-    "tree-sitter-python": "^0.20.4"
+    "tree-sitter-python": "^0.20.4",
+    "tree-sitter-typescript": "^0.23.2"
   }
 }

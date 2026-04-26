@@ -18,6 +18,7 @@ export interface ParseResult {
 let Parser: any = null;
 let Python: any = null;
 let JavaScript: any = null;
+let TypeScript: any = null;
 let Java: any = null;
 
 function loadTreeSitter(): boolean {
@@ -26,6 +27,12 @@ function loadTreeSitter(): boolean {
     Parser = require('tree-sitter');
     Python = require('tree-sitter-python');
     JavaScript = require('tree-sitter-javascript');
+    try {
+      const tsModule = require('tree-sitter-typescript');
+      TypeScript = tsModule.typescript ?? tsModule;
+    } catch {
+      TypeScript = null;
+    }
     Java = require('tree-sitter-java');
     return true;
   } catch {
@@ -53,7 +60,8 @@ class TreeSitterService {
     if (!this.parser) return false;
     try {
       if (languageId === 'python' && Python) this.parser.setLanguage(Python);
-      else if ((languageId === 'javascript' || languageId === 'typescript') && JavaScript) this.parser.setLanguage(JavaScript);
+      else if (languageId === 'javascript' && JavaScript) this.parser.setLanguage(JavaScript);
+      else if (languageId === 'typescript' && TypeScript) this.parser.setLanguage(TypeScript);
       else if (languageId === 'java' && Java) this.parser.setLanguage(Java);
       else return false;
       return true;

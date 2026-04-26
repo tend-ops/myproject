@@ -40,6 +40,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.generateFixedCode = generateFixedCode;
 exports.getExtension = getExtension;
 const vscode = __importStar(require("vscode"));
+const agentClient_1 = require("./agentClient");
 /** 按行号分组的审查项 */
 function groupByLine(items) {
     const map = new Map();
@@ -67,6 +68,32 @@ async function generateFixedCode(result, originalText) {
             return { fixedCode: '', summary: ['无法读取原文件'], appliedCount: 0 };
         }
     }
+    // 尝试使用AI Agent生成修复代码
+    const agentStatus = await (0, agentClient_1.checkAgentStatus)();
+    if (agentStatus) {
+        try {
+            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(result.filePath));
+            const issues = result.mergedItems.map(item => ({
+                category: item.category,
+                message: item.message,
+                line: item.line,
+                severity: item.severity
+            }));
+            const agentResult = await (0, agentClient_1.requestAgentFix)(document, issues);
+            if (agentResult && agentResult.fixed_code) {
+                return {
+                    fixedCode: agentResult.fixed_code,
+                    summary: ['使用 AI Agent 生成修复代码'],
+                    appliedCount: result.mergedItems.length
+                };
+            }
+        }
+        catch (error) {
+            console.error('AI Agent修复失败:', error);
+            // 回退到本地修复逻辑
+        }
+    }
+    // 本地修复逻辑
     const lines = source.split(/\r?\n/);
     const lang = result.filePath.endsWith('.py') ? 'python' : 'javascript';
     const byLine = groupByLine(result.mergedItems);

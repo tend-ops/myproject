@@ -8,6 +8,7 @@ import { runFullReview, runRuleCheckOnly, runSmartAnalysisOnly, getLastReviewRes
 import { registerCodeActions } from './codeActionProvider';
 import { registerSidebarView } from './sidebarView';
 import { generateFixedCode, getExtension } from './codeFixer';
+import { runBatchReview, indexProject } from './batchReviewManager';
 
 const SUPPORTED_LANGUAGES = new Set([
   'python', 'javascript', 'javascriptreact', 'typescript', 'typescriptreact', 'java'
@@ -133,6 +134,74 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('smartCodeReview.showReviewPanel', () => {
       vscode.commands.executeCommand('smartCodeReview.refreshReviewView');
       vscode.commands.executeCommand('workbench.view.extension.smartCodeReviewView');
+    })
+  );
+
+  // 命令：批量审查
+  context.subscriptions.push(
+    vscode.commands.registerCommand('smartCodeReview.runBatchReview', async () => {
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders) {
+        vscode.window.showErrorMessage('请打开一个工作区进行批量审查');
+        return;
+      }
+      
+      // 让用户选择文件类型
+      const fileTypes = await vscode.window.showQuickPick(
+        ['Python (.py)', 'JavaScript/TypeScript (.js, .ts)', 'Java (.java)', '所有支持的文件'],
+        { placeHolder: '选择要审查的文件类型' }
+      );
+      
+      if (!fileTypes) return;
+      
+      // 构建文件匹配模式
+      let pattern: string;
+      switch (fileTypes) {
+        case 'Python (.py)':
+          pattern = '**/*.py';
+          break;
+        case 'JavaScript/TypeScript (.js, .ts)':
+          pattern = '**/*.{js,ts,jsx,tsx}';
+          break;
+        case 'Java (.java)':
+          pattern = '**/*.java';
+          break;
+        default:
+          pattern = '**/*.{py,js,ts,java,jsx,tsx}';
+      }
+      
+      // 获取文件列表
+      const files = await vscode.workspace.findFiles(pattern, '**/node_modules/**|**/.git/**');
+      
+      if (files.length === 0) {
+        vscode.window.showInformationMessage('未找到可审查的代码文件');
+        return;
+      }
+      
+      // 确认审查
+      const confirm = await vscode.window.showInformationMessage(
+        `将审查 ${files.length} 个文件，这可能需要一些时间。是否继续？`,
+        '继续', '取消'
+      );
+      
+      if (confirm !== '继续') return;
+      
+      // 执行批量审查
+      await runBatchReview(files, context);
+    })
+  );
+
+  // 命令：索引项目
+  context.subscriptions.push(
+    vscode.commands.registerCommand('smartCodeReview.indexProject', async () => {
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders) {
+        vscode.window.showErrorMessage('请打开一个工作区进行索引');
+        return;
+      }
+      
+      const projectPath = workspaceFolders[0].uri.fsPath;
+      await indexProject(projectPath);
     })
   );
 

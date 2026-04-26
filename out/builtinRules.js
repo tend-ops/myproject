@@ -168,7 +168,6 @@ function runRefactorRules(document, ir) {
             }
         }
     }
-    console.log('Refactor items found:', items.length);
     return items;
 }
 //# sourceMappingURL=builtinRules.js.map

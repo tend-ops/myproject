@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+tree-sitter
+tree-sitter-languages
+requests
+pydantic
+langchain
+langchain-community
+langchain-openai
+chromadb
+sentence-transformers
+langchain-chroma
+
