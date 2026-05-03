@@ -51,6 +51,7 @@ const astExtract_1 = require("./astExtract");
 const resultCache_1 = require("./resultCache");
 const builtinRules_1 = require("./builtinRules");
 const crypto = __importStar(require("crypto"));
+const agentPayload_1 = require("./agentPayload");
 const diagnosticCollection = vscode.languages.createDiagnosticCollection('smartCodeReview');
 exports.diagnosticCollection = diagnosticCollection;
 /** 当前审查结果，供侧边栏与 CodeAction 使用 */
@@ -62,39 +63,36 @@ function getLastReviewResult() {
  * 处理Agent结果并更新诊断信息
  */
 async function handleAgentResult(document, context, agentResult, output) {
-    if (!agentResult)
+    if (!agentResult) {
         return false;
-    // 将 agentResult 中的 issues 转为 Diagnostics
+    }
+    const mergedItems = (0, agentPayload_1.parseAgentReviewResponse)(agentResult);
     const diagnostics = [];
-    for (const item of agentResult.issues) {
+    for (const item of mergedItems) {
         if (item.line > 0) {
             const line = Math.max(0, item.line - 1);
             const range = new vscode.Range(line, 0, line, 256);
-            const severity = item.severity === 'error' ? vscode.DiagnosticSeverity.Error
-                : item.severity === 'warning' ? vscode.DiagnosticSeverity.Warning
+            const severity = item.severity === 'error'
+                ? vscode.DiagnosticSeverity.Error
+                : item.severity === 'warning'
+                    ? vscode.DiagnosticSeverity.Warning
                     : vscode.DiagnosticSeverity.Information;
             diagnostics.push(new vscode.Diagnostic(range, item.message, severity));
         }
     }
     diagnosticCollection.set(document.uri, diagnostics);
-    // 构建FileReviewResult格式
+    const ruleIssues = Array.isArray(agentResult.ruleIssues)
+        ? agentResult.ruleIssues
+        : [];
     const result = {
         uri: document.uri.toString(),
         filePath: document.fileName,
-        contentHash: '',
-        timestamp: Date.now(),
-        ir: null,
-        ruleIssues: [],
-        aiResult: null,
-        mergedItems: agentResult.issues.map((issue) => ({
-            id: `agent-${issue.category}-${issue.line}-${issue.message.slice(0, 30)}`,
-            source: 'agent',
-            category: issue.category,
-            message: issue.message,
-            severity: issue.severity,
-            line: issue.line,
-            column: 0
-        }))
+        contentHash: typeof agentResult.contentHash === 'string' ? agentResult.contentHash : '',
+        timestamp: typeof agentResult.timestamp === 'number' ? agentResult.timestamp : Date.now(),
+        ir: agentResult.ir ?? null,
+        ruleIssues,
+        aiResult: agentResult.aiResult ?? null,
+        mergedItems
     };
     lastReviewResult = result;
     (0, resultCache_1.setCachedResult)(context, result);
@@ -102,14 +100,17 @@ async function handleAgentResult(document, context, agentResult, output) {
     await vscode.commands.executeCommand('workbench.view.extension.smartCodeReview');
     if (output) {
         output.appendLine('=== Agent 审查完成 ===');
-        if (agentResult.execution_time) {
-            output.appendLine(`[Agent] 执行时间: ${agentResult.execution_time.total.toFixed(2)}ms`);
+        const ms = agentResult.execution_time?.total ?? agentResult.executionTime?.total;
+        if (typeof ms === 'number') {
+            output.appendLine(`[Agent] 执行时间: ${ms.toFixed(1)}ms`);
         }
-        output.appendLine(`[Agent] 发现问题: ${agentResult.issues.length} 个`);
-        if (agentResult.summary && agentResult.summary.by_category) {
-            for (const category in agentResult.summary.by_category) {
-                output.appendLine(`  ${category}: ${agentResult.summary.by_category[category]}`);
-            }
+        output.appendLine(`[Agent] 发现问题: ${mergedItems.length} 个`);
+        const byCat = {};
+        for (const it of mergedItems) {
+            byCat[it.category] = (byCat[it.category] ?? 0) + 1;
+        }
+        for (const k of Object.keys(byCat).sort()) {
+            output.appendLine(`  ${k}: ${byCat[k]}`);
         }
     }
     return true;

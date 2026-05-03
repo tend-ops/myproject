@@ -167,8 +167,8 @@
         },
         "smartCodeReview.agent.timeout": {
           "type": "number",
-          "default": 500,
-          "description": "与 AI Agent 通信的超时时间（毫秒），用于控制单文件审查响应时长。"
+          "default": 120000,
+          "description": "与 AI Agent 通信的超时时间（毫秒）；审查/修复单次请求使用，建议 ≥ 60000。"
         },
         "smartCodeReview.rules.enableBuiltin": {
           "type": "boolean",
@@ -199,7 +199,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
-    "test": "echo \"No tests yet\"",
+    "test": "npm run compile && node tests/agent.contract.test.cjs",
+    "test:python": "python -m pytest tests/test_agent_contract.py -v",
     "agent": "cd review_agent && python -m venv .venv && .venv\\Scripts\\activate && pip install -r requirements.txt && uvicorn server:app --host 0.0.0.0 --port 5000"
   },
   "devDependencies": {

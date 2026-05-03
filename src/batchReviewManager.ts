@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { runFullReview } from './reviewCoordinator';
+import { getNormalizedAgentOrigin } from './agentClient';
 
 /**
  * 批量审查管理器
@@ -77,10 +78,13 @@ export async function indexProject(projectPath: string): Promise<void> {
   output.appendLine(`开始索引项目: ${projectPath}`);
   
   try {
-    const config = vscode.workspace.getConfiguration('smartCodeReview');
-    const agentServerUrl = config.get<string>('agent.serverUrl', 'http://localhost:8000');
-    const indexUrl = `${agentServerUrl}/index-project`;
-    
+    const origin = getNormalizedAgentOrigin();
+    if (!origin) {
+      vscode.window.showErrorMessage('请先在设置中配置 smartCodeReview.agent.serverUrl');
+      return;
+    }
+    const indexUrl = `${origin}/index-project`;
+
     const response = await fetch(indexUrl, {
       method: 'POST',
       headers: {

@@ -90,7 +90,12 @@ export function activate(context: vscode.ExtensionContext) {
       out.appendLine('共应用 ' + fixResult.appliedCount + ' 处修改建议。');
       const ext = getExtension(last);
       const langMap: Record<string, string> = {
-        py: 'python', js: 'javascript', ts: 'typescript', jsx: 'javascriptreact', tsx: 'typescriptreact'
+        py: 'python',
+        js: 'javascript',
+        ts: 'typescript',
+        jsx: 'javascriptreact',
+        tsx: 'typescriptreact',
+        java: 'java'
       };
       const baseName = last.filePath.replace(/[/\\]/g, '/').split('/').pop() || 'file';
       const fixedName = baseName.replace(/\.[^.]+$/, '') + '_fixed.' + (ext || 'txt');

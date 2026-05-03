@@ -37,14 +37,14 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getNormalizedAgentOrigin = getNormalizedAgentOrigin;
 exports.requestAgentReview = requestAgentReview;
 exports.checkAgentStatus = checkAgentStatus;
 exports.requestBatchReview = requestBatchReview;
 exports.requestAgentFix = requestAgentFix;
 const vscode = __importStar(require("vscode"));
-// 使用 Node.js 内置的 fetch API
 const fetch = globalThis.fetch;
-const KNOWN_AGENT_PATHS = new Set(['/review', '/status', '/batch-review', '/fix', '/index-project']);
+const KNOWN_AGENT_PATHS = new Set(['/review', '/status', '/batch-review', '/fix', '/index-project', '/ping', '/clear-index']);
 function getAgentBaseUrl() {
     const config = vscode.workspace.getConfiguration('smartCodeReview');
     const raw = (config.get('agent.serverUrl', '') || '').trim();
@@ -53,7 +53,6 @@ function getAgentBaseUrl() {
     try {
         const parsed = new URL(raw);
         const normalizedPath = parsed.pathname.replace(/\/+$/, '');
-        // 允许用户填写到具体接口，如 /review，内部统一回退到服务根路径。
         if (KNOWN_AGENT_PATHS.has(normalizedPath)) {
             parsed.pathname = '';
         }
@@ -65,51 +64,65 @@ function getAgentBaseUrl() {
         return null;
     }
 }
+/** 供索引等其它模块使用，与 buildAgentUrl 同源归一化 */
+function getNormalizedAgentOrigin() {
+    return getAgentBaseUrl();
+}
 function buildAgentUrl(path) {
     const base = getAgentBaseUrl();
     if (!base)
         return null;
     return `${base}${path.startsWith('/') ? path : `/${path}`}`;
 }
-/**
- * 调用AI Agent进行代码审查
- */
+/** 审查/修复等长请求超时；配置异常时回退 120s，并限制在 [5s, 10min] */
+function getAgentLongTimeoutMs() {
+    const c = vscode.workspace.getConfiguration('smartCodeReview');
+    const raw = c.get('agent.timeout', 120000);
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+        return 120000;
+    }
+    return Math.min(Math.max(raw, 5000), 600000);
+}
+async function fetchWithTimeout(endpoint, init, timeoutMs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+        return await fetch(endpoint, { ...init, signal: ctl.signal });
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
 async function requestAgentReview(document, _syntaxErrors, _ruleIssues, _ir) {
     const endpoint = buildAgentUrl('/review');
     if (!endpoint)
         return null;
     try {
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 languageId: document.languageId,
                 filePath: document.fileName,
                 code: document.getText()
             })
-        });
+        }, getAgentLongTimeoutMs());
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        const result = await response.json();
-        return result;
+        return await response.json();
     }
     catch (error) {
         console.error('AI Agent调用失败:', error);
         return null;
     }
 }
-/**
- * 检查AI Agent服务状态
- */
 async function checkAgentStatus() {
     const endpoint = buildAgentUrl('/status');
     if (!endpoint)
         return false;
     try {
-        const response = await fetch(endpoint);
+        const response = await fetchWithTimeout(endpoint, { method: 'GET' }, 8000);
         return response.ok;
     }
     catch (error) {
@@ -117,9 +130,6 @@ async function checkAgentStatus() {
         return false;
     }
 }
-/**
- * 批量审查多个文件
- */
 async function requestBatchReview(documents) {
     const endpoint = buildAgentUrl('/batch-review');
     if (!endpoint)
@@ -130,49 +140,40 @@ async function requestBatchReview(documents) {
             filePath: doc.fileName,
             code: doc.getText()
         }));
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(inputs)
-        });
+        }, getAgentLongTimeoutMs());
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        const result = await response.json();
-        return result;
+        return await response.json();
     }
     catch (error) {
         console.error('批量审查请求失败:', error);
         return null;
     }
 }
-/**
- * 请求Agent生成修复代码
- */
 async function requestAgentFix(document, issues) {
     const endpoint = buildAgentUrl('/fix');
     if (!endpoint)
         return null;
     try {
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 languageId: document.languageId,
                 filePath: document.fileName,
                 code: document.getText(),
-                issues: issues
+                issues
             })
-        });
+        }, getAgentLongTimeoutMs());
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        const result = await response.json();
-        return result;
+        return await response.json();
     }
     catch (error) {
         console.error('AI Agent修复请求失败:', error);

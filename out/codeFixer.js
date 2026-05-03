@@ -1,7 +1,6 @@
 "use strict";
 /**
- * 根据审查结果生成修复后的代码：对安全、部分规范问题做自动修复建议，
- * 并在有 exampleCode 时采用 AI 建议，输出完整「修复后」源码供对比或保存。
+ * 根据审查结果生成修复后的代码：Agent 首选；否则本地对常见安全风险与规范做保守改写。
  */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -41,6 +40,16 @@ exports.generateFixedCode = generateFixedCode;
 exports.getExtension = getExtension;
 const vscode = __importStar(require("vscode"));
 const agentClient_1 = require("./agentClient");
+function fileProgrammingLang(fp) {
+    const l = fp.toLowerCase().replace(/\\/g, '/');
+    if (l.endsWith('.py'))
+        return 'python';
+    if (l.endsWith('.java'))
+        return 'java';
+    if (l.endsWith('.ts') || l.endsWith('.tsx'))
+        return 'typescript';
+    return 'javascript';
+}
 /** 按行号分组的审查项 */
 function groupByLine(items) {
     const map = new Map();
@@ -68,7 +77,6 @@ async function generateFixedCode(result, originalText) {
             return { fixedCode: '', summary: ['无法读取原文件'], appliedCount: 0 };
         }
     }
-    // 尝试使用AI Agent生成修复代码
     const agentStatus = await (0, agentClient_1.checkAgentStatus)();
     if (agentStatus) {
         try {
@@ -80,22 +88,31 @@ async function generateFixedCode(result, originalText) {
                 severity: item.severity
             }));
             const agentResult = await (0, agentClient_1.requestAgentFix)(document, issues);
-            if (agentResult && agentResult.fixed_code) {
+            if (agentResult && typeof agentResult.fixed_code === 'string' && agentResult.fixed_code.length > 0) {
+                const meta = agentResult.fix_meta;
+                const summary = ['使用 AI Agent 生成修复代码'];
+                if (meta?.validated) {
+                    summary.push('模型输出已通过长度/语法等校验');
+                }
+                if (meta?.deterministic_notes?.length) {
+                    summary.push('规则兜底: ' + meta.deterministic_notes.join('; '));
+                }
+                const appliedCount = meta?.validated
+                    ? result.mergedItems.length
+                    : Math.max(1, result.mergedItems.filter(i => i.category === 'security' || i.category === 'syntax').length);
                 return {
                     fixedCode: agentResult.fixed_code,
-                    summary: ['使用 AI Agent 生成修复代码'],
-                    appliedCount: result.mergedItems.length
+                    summary,
+                    appliedCount
                 };
             }
         }
         catch (error) {
             console.error('AI Agent修复失败:', error);
-            // 回退到本地修复逻辑
         }
     }
-    // 本地修复逻辑
     const lines = source.split(/\r?\n/);
-    const lang = result.filePath.endsWith('.py') ? 'python' : 'javascript';
+    const lang = fileProgrammingLang(result.filePath);
     const byLine = groupByLine(result.mergedItems);
     const summary = [];
     let appliedCount = 0;
@@ -118,7 +135,7 @@ async function generateFixedCode(result, originalText) {
                         out = out.replace(/\beval\s*\(/g, 'ast.literal_eval(');
                         needAstImport.value = true;
                         appliedCount++;
-                        summary.push(`L${lineNum}: eval → ast.literal_eval`);
+                        summary.push(`L${lineNum}: eval → literal_eval`);
                     }
                     if (/\bexec\s*\(/.test(out) && !out.trim().startsWith('#')) {
                         out = '# FIXME: 避免使用 exec\n' + out;
@@ -126,11 +143,26 @@ async function generateFixedCode(result, originalText) {
                         summary.push(`L${lineNum}: 已标注 exec 风险`);
                     }
                 }
-                if (lang === 'javascript' || result.filePath.endsWith('.ts')) {
+                if (lang === 'javascript' || lang === 'typescript') {
                     if (/\beval\s*\(/.test(out) && !out.trim().startsWith('//')) {
                         out = '// FIXME: 避免使用 eval\n' + out;
                         appliedCount++;
                         summary.push(`L${lineNum}: 已标注 eval 风险`);
+                    }
+                    if (/\binnerHTML\s*=/.test(out) && !out.includes('sanitize') && !out.trim().startsWith('//')) {
+                        out = '// FIXME: innerHTML XSS 风险，请改用安全 API 或消毒\n' + out;
+                        appliedCount++;
+                        summary.push(`L${lineNum}: 已标注 innerHTML 风险`);
+                    }
+                }
+                if (lang === 'java') {
+                    const sqlDynamic = /(executeQuery|executeUpdate)\s*\(\s*"[^"]*"[^)]*\+/i.test(out) ||
+                        (/\+\s*\w+/.test(out) && /"(?:SELECT|INSERT|UPDATE|DELETE)/i.test(out));
+                    if (sqlDynamic && !out.includes('PreparedStatement')) {
+                        const indent = /^(\s*)/.exec(out)?.[1] ?? '';
+                        out = indent + '// FIXME: SQL 拼接注入风险 — 改用 PreparedStatement 绑定参数\n' + out;
+                        appliedCount++;
+                        summary.push(`L${lineNum}: 已标注 SQL 拼接风险`);
                     }
                 }
             }
@@ -140,10 +172,15 @@ async function generateFixedCode(result, originalText) {
                     appliedCount++;
                     summary.push(`L${lineNum}: 添加 noqa`);
                 }
-                if ((lang === 'javascript' || result.filePath.endsWith('.ts')) && !out.trim().startsWith('//')) {
+                if ((lang === 'javascript' || lang === 'typescript') && !out.trim().startsWith('//')) {
                     out = '// eslint-disable-next-line ' + (item.code || '') + '\n' + out;
                     appliedCount++;
                     summary.push(`L${lineNum}: 添加 eslint-disable-next-line`);
+                }
+                if (lang === 'java' && !out.trim().startsWith('//')) {
+                    out = '// CHECKSTYLE:OFF ' + (item.code || '') + '\n' + out;
+                    appliedCount++;
+                    summary.push(`L${lineNum}: 添加 CHECKSTYLE:OFF（请按需收敛）`);
                 }
             }
         }
@@ -153,12 +190,7 @@ async function generateFixedCode(result, originalText) {
     let fixedCode = newLines.join('\n');
     if (lang === 'python' && needAstImport.value && !fixedCode.includes('import ast')) {
         const firstImport = fixedCode.match(/^import\s+|^from\s+/m);
-        if (firstImport) {
-            fixedCode = 'import ast\n' + fixedCode;
-        }
-        else {
-            fixedCode = 'import ast\n\n' + fixedCode;
-        }
+        fixedCode = firstImport ? 'import ast\n' + fixedCode : 'import ast\n\n' + fixedCode;
         appliedCount++;
         summary.push('已添加 import ast');
     }
@@ -168,7 +200,7 @@ async function generateFixedCode(result, originalText) {
 }
 /** 取当前审查文件的扩展名以判断语言 */
 function getExtension(result) {
-    const m = result.filePath.match(/\.(py|js|ts|jsx|tsx)$/i);
+    const m = result.filePath.match(/\.(py|js|ts|jsx|tsx|java)$/i);
     return m ? m[1].toLowerCase() : 'txt';
 }
 //# sourceMappingURL=codeFixer.js.map

@@ -37,6 +37,7 @@ exports.runBatchReview = runBatchReview;
 exports.indexProject = indexProject;
 const vscode = __importStar(require("vscode"));
 const reviewCoordinator_1 = require("./reviewCoordinator");
+const agentClient_1 = require("./agentClient");
 /**
  * 批量审查管理器
  * 处理多文件并行审查的核心逻辑
@@ -103,9 +104,12 @@ async function indexProject(projectPath) {
     const output = vscode.window.createOutputChannel('Smart Code Review');
     output.appendLine(`开始索引项目: ${projectPath}`);
     try {
-        const config = vscode.workspace.getConfiguration('smartCodeReview');
-        const agentServerUrl = config.get('agent.serverUrl', 'http://localhost:8000');
-        const indexUrl = `${agentServerUrl}/index-project`;
+        const origin = (0, agentClient_1.getNormalizedAgentOrigin)();
+        if (!origin) {
+            vscode.window.showErrorMessage('请先在设置中配置 smartCodeReview.agent.serverUrl');
+            return;
+        }
+        const indexUrl = `${origin}/index-project`;
         const response = await fetch(indexUrl, {
             method: 'POST',
             headers: {

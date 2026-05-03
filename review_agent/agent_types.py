@@ -81,8 +81,17 @@ class FileReviewResult(BaseModel):
     aiResult: Optional[AiAnalysisResult]
     mergedItems: List[MergedReviewItem]
 
+class FixIssuePayload(BaseModel):
+    """客户端「生成修复」时传入的问题列表条目（跳过重复全量审查）。"""
+    category: str = "style"
+    message: str
+    line: int = 0
+    severity: str = "warning"
+
+
 class AgentReviewInput(BaseModel):
     languageId: str
     filePath: str
     code: str
     cursorLine: Optional[int] = None
+    issues: Optional[List[FixIssuePayload]] = None

@@ -19,6 +19,7 @@ import {
   CodeIntermediateRepresentation
 } from './types';
 import * as crypto from 'crypto';
+import { parseAgentReviewResponse } from './agentPayload';
 
 const diagnosticCollection = vscode.languages.createDiagnosticCollection('smartCodeReview');
 
@@ -33,61 +34,64 @@ export function getLastReviewResult(): FileReviewResult | null {
  * 处理Agent结果并更新诊断信息
  */
 async function handleAgentResult(document: vscode.TextDocument, context: vscode.ExtensionContext, agentResult: any, output?: vscode.OutputChannel): Promise<boolean> {
-  if (!agentResult) return false;
-  
-  // 将 agentResult 中的 issues 转为 Diagnostics
+  if (!agentResult) {
+    return false;
+  }
+
+  const mergedItems = parseAgentReviewResponse(agentResult);
+
   const diagnostics: vscode.Diagnostic[] = [];
-  for (const item of agentResult.issues) {
+  for (const item of mergedItems) {
     if (item.line > 0) {
       const line = Math.max(0, item.line - 1);
       const range = new vscode.Range(line, 0, line, 256);
-      const severity = 
-        item.severity === 'error' ? vscode.DiagnosticSeverity.Error
-        : item.severity === 'warning' ? vscode.DiagnosticSeverity.Warning
-        : vscode.DiagnosticSeverity.Information;
+      const severity =
+        item.severity === 'error'
+          ? vscode.DiagnosticSeverity.Error
+          : item.severity === 'warning'
+            ? vscode.DiagnosticSeverity.Warning
+            : vscode.DiagnosticSeverity.Information;
       diagnostics.push(new vscode.Diagnostic(range, item.message, severity));
     }
   }
   diagnosticCollection.set(document.uri, diagnostics);
 
-  // 构建FileReviewResult格式
+  const ruleIssues: RuleIssue[] = Array.isArray(agentResult.ruleIssues)
+    ? (agentResult.ruleIssues as RuleIssue[])
+    : [];
+
   const result: FileReviewResult = {
     uri: document.uri.toString(),
     filePath: document.fileName,
-    contentHash: '',
-    timestamp: Date.now(),
-    ir: null,
-    ruleIssues: [],
-    aiResult: null,
-    mergedItems: agentResult.issues.map((issue: { category: string; line: number; message: string; severity: string }) => ({
-      id: `agent-${issue.category}-${issue.line}-${issue.message.slice(0, 30)}`,
-      source: 'agent',
-      category: issue.category,
-      message: issue.message,
-      severity: issue.severity,
-      line: issue.line,
-      column: 0
-    }))
+    contentHash: typeof agentResult.contentHash === 'string' ? agentResult.contentHash : '',
+    timestamp: typeof agentResult.timestamp === 'number' ? agentResult.timestamp : Date.now(),
+    ir: agentResult.ir ?? null,
+    ruleIssues,
+    aiResult: agentResult.aiResult ?? null,
+    mergedItems
   };
 
   lastReviewResult = result;
   setCachedResult(context, result);
   await vscode.commands.executeCommand('smartCodeReview.refreshReviewView');
   await vscode.commands.executeCommand('workbench.view.extension.smartCodeReview');
-  
+
   if (output) {
     output.appendLine('=== Agent 审查完成 ===');
-    if (agentResult.execution_time) {
-      output.appendLine(`[Agent] 执行时间: ${agentResult.execution_time.total.toFixed(2)}ms`);
+    const ms = agentResult.execution_time?.total ?? agentResult.executionTime?.total;
+    if (typeof ms === 'number') {
+      output.appendLine(`[Agent] 执行时间: ${ms.toFixed(1)}ms`);
     }
-    output.appendLine(`[Agent] 发现问题: ${agentResult.issues.length} 个`);
-    if (agentResult.summary && agentResult.summary.by_category) {
-      for (const category in agentResult.summary.by_category) {
-        output.appendLine(`  ${category}: ${agentResult.summary.by_category[category]}`);
-      }
+    output.appendLine(`[Agent] 发现问题: ${mergedItems.length} 个`);
+    const byCat: Record<string, number> = {};
+    for (const it of mergedItems) {
+      byCat[it.category] = (byCat[it.category] ?? 0) + 1;
+    }
+    for (const k of Object.keys(byCat).sort()) {
+      output.appendLine(`  ${k}: ${byCat[k]}`);
     }
   }
-  
+
   return true;
 }
 

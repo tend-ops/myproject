@@ -571,7 +571,7 @@ Just choose `xelatex', no `pdflatex' or `latex' and so on.}
     \addcontentsline{toc}{section}{参考文献} % 由于参考文献不是section，这句把参考文献加入目录
 	\zihao{5} \kaishu
 	\bibliographystyle{gbt7714-numerical}
-    \bibliography{thesis-references}
+    \bibliography{thesis-references,content-references}
     \newpage
     
     % % 改回section样式 

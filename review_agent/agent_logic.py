@@ -1,47 +1,56 @@
 import hashlib
+import os
 import subprocess
 import json
 import time
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from tree_sitter import Parser
 from langchain_openai import OpenAI
 from .types import (CodeIntermediateRepresentation, RuleIssue, FileReviewResult, MergedReviewItem,
                     AiAnalysisResult, AiSuggestionItem, AgentReviewInput)
 from .vector_store import vector_store
 
-SELF_REVIEW_MAX_ROUNDS = 3
+# 自我审查轮次：每轮一次 LLM 调用；默认为 1 以兼顾速度与稳定性（可通过环境变量覆盖）
+SELF_REVIEW_MAX_ROUNDS = int(os.environ.get("REVIEW_AGENT_SELF_REVIEW_ROUNDS", "1"))
+MAX_CODE_CHARS_MAIN_REVIEW = int(os.environ.get("REVIEW_AGENT_MAX_CODE_CHARS", "12000"))
+ENABLE_VECTOR_RAG = os.environ.get("REVIEW_AGENT_ENABLE_RAG", "").strip().lower() in {"1", "true", "yes"}
+
+VALID_AI_CATEGORIES = frozenset({"security", "performance", "refactor", "style", "syntax"})
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_FEWSHOT_PATH = PROMPTS_DIR / "fewshot_review.md"
 DEFAULT_SELF_REVIEW_PATH = PROMPTS_DIR / "self_review.md"
 DEFAULT_FEW_SHOT_EXAMPLES = """
-[示例]
 语言: python
 代码:
 eval(input("cmd:"))
 输出:
-- [security] 避免直接执行用户输入，建议使用白名单或安全解析
+[{"category":"security","line":1,"message":"禁止对用户输入使用 eval，应使用白名单或安全解析接口"}]
 """.strip()
-DEFAULT_SELF_REVIEW_TEMPLATE = """
-你是一个专业的代码审查助手，现在需要对已有审查结果进行第 {round_index} 轮自我审查和改进。
+DEFAULT_SELF_REVIEW_TEMPLATE = (
+    "请以 JSON 数组输出新增审查项（无则 []），每项含 category,line,message。\n"
+    "语言: {language_id}\n代码:\n{code}\n已有结果:\n{review_summary}\n轮次:{round_index}\n"
+)
 
-语言: {language_id}
-
-代码片段（可能被截断）:
-{code}
-
-当前审查结果:
-{review_summary}
-
-请执行：
-1) 指出遗漏的重要问题（优先安全、性能、语法、重构）
-2) 删除明显误报（如果有）
-3) 输出“新增或修正”的问题，不要重复已有项
-
-输出格式严格为每行一个问题：
-- [security|performance|refactor|style|syntax] 具体建议
-""".strip()
+LANGUAGE_REVIEW_FOCUS: dict[str, str] = {
+    "python": (
+        "Python：输入校验、eval/exec/subprocess 与 shell=True、Pickle、反序列化、SQL 拼接注入、密钥硬编码、"
+        "资源未关闭（with）、裸露 except、可变默认参数、日志敏感信息。"
+    ),
+    "javascript": (
+        "JavaScript 重点：eval/Function构造器、innerHTML/DOM XSS、明文密钥、异步错误未处理"
+        "、== 与宽松相等、服务端模板注入前端场景、正则 ReDoS、依赖供应链敏感 API。"
+    ),
+    "typescript": (
+        "TypeScript：除 JS 安全风险外，关注 any 泛滥、断言掩盖空值、非空假设与运行时脱节、"
+        "泛型/API 契约错误。"
+    ),
+    "java": (
+        "Java 重点：SQL/JPQL 字符串拼接注入、JNI/反序列化、路径遍历 Files/Paths、"
+        "并发可见性、资源未 try-with-resources、equals/hashCode 契约、敏感日志。"
+    ),
+}
 
 
 def load_prompt_template(file_name: str, fallback: str) -> str:
@@ -287,130 +296,147 @@ def run_linters(language_id: str, code: str) -> list[RuleIssue]:
     return []
 
 
+def _find_java_sql_concat_line(src: str) -> int:
+    for i, line in enumerate(src.splitlines(), start=1):
+        if '+' in line and re.search(r'execute(Query|Update)\(', line, re.IGNORECASE):
+            return i
+    return 1
+
+
 def run_builtin_rules(language_id: str, code: str) -> tuple[list[MergedReviewItem], list[MergedReviewItem], list[MergedReviewItem]]:
-    # simple placeholder; real rules could inspect AST
-    security = []
-    performance = []
-    refactor = []
-    # example: if "eval" in code -> security
+    security: list[MergedReviewItem] = []
+    performance: list[MergedReviewItem] = []
+    refactor: list[MergedReviewItem] = []
+    lowered = code.lower()
+
+    def add_security(line_hint: int, msg: str, rid: str) -> None:
+        security.append(
+            MergedReviewItem(
+                id=rid, source='rule', category='security', message=msg,
+                severity='error', line=line_hint or 1, column=1
+            )
+        )
+
     if 'eval(' in code:
-        security.append(MergedReviewItem(
-            id='builtin-security-eval',
-            source='rule',
-            category='security',
-            message='使用 eval 可能导致安全问题',
-            severity='error',
-            line=1,
-            column=1
-        ))
+        line_no = code[: code.find('eval(')].count('\n') + 1
+        add_security(line_no, '检测到 eval(...) 调用，存在任意代码执行风险', 'builtin-security-eval')
+
+    if language_id == 'python' and re.search(r'\bexec\s*\(', code) and not re.search(r'^\s*#.*\bexec\s*\(', code, re.MULTILINE):
+        ix = max(code.find('exec('), 0)
+        add_security(code[:ix].count('\n') + 1, 'exec 可能被滥用于代码注入，应避免对用户输入或可变字符串执行 exec', 'builtin-py-exec')
+
+    if language_id in {'javascript', 'typescript'}:
+        if re.search(r'\binnerHTML\s*=', code):
+            refactor.append(MergedReviewItem(
+                id='builtin-dom-innerhtml',
+                source='rule', category='refactor', message='直接赋值 innerHTML 可能导致 XSS，建议 textContent、DOMPurify 或框架安全绑定',
+                severity='warning', line=1, column=1,
+            ))
+        if 'document.write(' in lowered:
+            add_security(1, 'document.write 存在 XSS 与性能隐患，应避免', 'builtin-js-docwrite')
+
+    if language_id == 'java':
+        if 'createstatement()' in lowered and re.search(r'execute(Query|Update)\(\s*"[^"]*"\s*\+', code, re.IGNORECASE):
+            add_security(
+                _find_java_sql_concat_line(code),
+                '检测到 Statement 与字符串拼接 SQL，存在注入风险；应使用 PreparedStatement 绑定参数',
+                'builtin-java-sql-inject'
+            )
+        if 'objectinputstream' in lowered:
+            security.append(MergedReviewItem(
+                id='builtin-java-deser',
+                source='rule', category='security', message='反序列化入口需白名单校验与最小权限',
+                severity='warning', line=1, column=1,
+            ))
+
     return security, performance, refactor
 
 
 
 
+def _llm(low_temp: float, max_tokens: int) -> OpenAI:
+    return OpenAI(
+        openai_api_base=os.environ.get("OLLAMA_OPENAI_BASE", "http://localhost:11434/v1"),
+        openai_api_key=os.environ.get("OPENAI_API_KEY", "not-needed"),
+        model_name=os.environ.get("REVIEW_AGENT_MODEL", "codellama:7b-instruct"),
+        temperature=low_temp,
+        max_tokens=max_tokens,
+    )
 
-def call_ai_agent(language_id: str, file_path: str, code: str, context_summary: str, syntax: list[str], lint_issues: list[RuleIssue]) -> Optional[AiAnalysisResult]:
-    # 直接使用 OpenAI 调用模型
+
+def language_focus(language_id: str) -> str:
+    return LANGUAGE_REVIEW_FOCUS.get(language_id, LANGUAGE_REVIEW_FOCUS.get("javascript", ""))
+
+
+def _strip_json_fence(text: str) -> str:
+    t = str(text).strip()
+    if not t:
+        return t
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return t
+
+
+def _extract_first_json_array(text: str) -> Optional[list]:
+    cleaned = _strip_json_fence(text)
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
     try:
-        # 配置 LLM - 这里假设使用本地 CodeLlama 服务，或可替换为 OpenAI
-        llm = OpenAI(
-            openai_api_base="http://localhost:11434/v1",  # Ollama 默认地址
-            openai_api_key="not-needed",  # Ollama 不需要 key
-            model_name="codellama:7b-instruct",
-            temperature=0.7,
-            max_tokens=2048
-        )
-
-        # 构建检索查询
-        query = f"代码审查: {language_id} 文件 {file_path} 内容: {code[:500]}..."
-        # 搜索相关文档
-        relevant_docs = vector_store.search(query, k=3)
-        
-        # 构建检索上下文
-        retrieval_context = ""
-        if relevant_docs:
-            retrieval_context = "检索到的相关信息:\n"
-            for doc in relevant_docs:
-                source = doc.get('metadata', {}).get('source', 'unknown')
-                path = doc.get('metadata', {}).get('path', 'unknown')
-                content = doc.get('content', '')[:300]  # 限制内容长度
-                retrieval_context += f"[来源: {source} - {path}]\n{content}...\n\n"
-
-        # 准备输入
-        lint_str = "; ".join([f"[{issue.tool}] {issue.message}" for issue in lint_issues])
-        syntax_str = "; ".join(syntax)
-
-        few_shot_examples = get_few_shot_examples()
-
-        # 构建提示（Few-shot）
-        prompt = f"""
-        你是一个专业的代码审查助手，需要对以下代码进行全面分析：
-
-        下面是高质量输出示例（few-shot），请严格参考其风格、粒度和类别标注方式：
-        {few_shot_examples}
-
-        语言: {language_id}
-        文件路径: {file_path}
-
-        上下文信息: {context_summary}
-
-        语法错误: {syntax_str}
-
-        规范问题: {lint_str}
-
-        {retrieval_context}
-
-        代码片段:
-        {code}
-
-        请按照以下维度进行分析：
-        1. 安全漏洞识别：检测潜在的安全问题，如注入攻击、XSS、命令执行等
-        2. 性能优化建议：识别性能瓶颈，如循环效率、内存使用等
-        3. 重构方案生成：提出代码结构改进建议，如长函数拆分、重复代码提取等
-        4. 代码规范检查：确保代码符合最佳实践和编码规范
-
-        请提供详细的分析结果，包括问题位置、原因分析和改进建议。对于每个问题，请指明具体的行号（如果可能）和修复方案。
-        输出时请尽量使用以下格式逐行给出：
-        - [security|performance|refactor|style|syntax] 具体建议
-        """
-
-        # 直接调用模型
-        raw = llm.invoke(prompt)
-        # 解析结果
-        items = parse_ai_response(raw)
-        return AiAnalysisResult(summary="AI 分析完成", items=items, raw=raw)
-
-    except Exception as e:
-        print(f"AI call failed: {e}")
+        return json.loads(cleaned[start : end + 1])
+    except Exception:
         return None
 
 
-def parse_ai_response(raw_response: str) -> list[AiSuggestionItem]:
-    # 简单的解析逻辑，可以扩展为更智能的解析
-    items = []
-    categories = {
-        '安全': 'security',
-        '性能': 'performance',
-        '重构': 'refactor',
-        '规范': 'style',
-        '语法': 'syntax'
-    }
+def _items_from_json_array(data: list) -> list[AiSuggestionItem]:
+    out: list[AiSuggestionItem] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        cat = str(entry.get("category", "style")).lower().strip()
+        if cat not in VALID_AI_CATEGORIES:
+            cat = "style"
+        msg_raw = entry.get("message") or entry.get("description") or ""
+        msg = str(msg_raw).strip().replace("\n", " ")
+        if len(msg) < 4:
+            continue
+        line_val = entry.get("line")
+        try:
+            line_no = int(line_val) if line_val is not None else 0
+        except Exception:
+            line_no = 0
+        out.append(AiSuggestionItem(category=cat, description=msg, line=max(0, line_no)))
+    return out
 
+
+def parse_ai_review_json_first(raw_response: Any) -> list[AiSuggestionItem]:
+    txt = raw_response if isinstance(raw_response, str) else str(raw_response)
+    data = _extract_first_json_array(txt)
+    if data is not None and isinstance(data, list):
+        return _items_from_json_array(data)
+    return []
+
+
+def parse_ai_response_line_fallback(raw_response: str) -> list[AiSuggestionItem]:
+    items: list[AiSuggestionItem] = []
+    cats_zh = {'安全': 'security', '性能': 'performance', '重构': 'refactor', '规范': 'style', '语法': 'syntax'}
     lines = str(raw_response).split('\n')
     current_category = 'style'
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        # 检查是否是类别标题
-        for key, cat in categories.items():
+        for key, cat in cats_zh.items():
             if key in line:
                 current_category = cat
                 break
-        # 如果是建议行
         if line.startswith('-') or line.startswith('•') or line.startswith('*'):
             payload = line[1:].strip()
-            bracket_match = re.match(r'^\[(security|performance|refactor|style|syntax)\]\s*(.+)$', payload, re.IGNORECASE)
+            bracket_match = re.match(
+                r'^\[(security|performance|refactor|style|syntax)\]\s*(.+)$', payload, re.IGNORECASE
+            )
             if bracket_match:
                 cat = bracket_match.group(1).lower()
                 desc = bracket_match.group(2).strip()
@@ -418,6 +444,76 @@ def parse_ai_response(raw_response: str) -> list[AiSuggestionItem]:
             else:
                 items.append(AiSuggestionItem(category=current_category, description=payload))
     return items
+
+
+def parse_ai_response(raw_response: Any) -> list[AiSuggestionItem]:
+    parsed = parse_ai_review_json_first(raw_response)
+    if parsed:
+        return parsed
+    return parse_ai_response_line_fallback(str(raw_response))
+
+
+def call_ai_agent(language_id: str, file_path: str, code: str, context_summary: str, syntax: list[str], lint_issues: list[RuleIssue]) -> Optional[AiAnalysisResult]:
+    try:
+        max_review_tokens = min(1536, int(os.environ.get("REVIEW_AGENT_MAX_REVIEW_TOKENS", "1536")))
+        llm = _llm(low_temp=0.08, max_tokens=max_review_tokens)
+
+        retrieval_context = ""
+        if ENABLE_VECTOR_RAG:
+            query = f"审查 {language_id} {file_path} {code[:400]}"
+            relevant_docs = vector_store.search(query, k=3)
+            if relevant_docs:
+                retrieval_context = "检索补充:\n"
+                for doc in relevant_docs:
+                    retrieval_context += doc.get('content', '')[:220] + "\n"
+
+        lint_str = "; ".join([f"{issue.tool}:{issue.message}(L{issue.line})" for issue in lint_issues[:40]])
+        syntax_str = "; ".join(syntax[:20])
+        few_shot = get_few_shot_examples()
+        code_body = code[:MAX_CODE_CHARS_MAIN_REVIEW]
+        focus = language_focus(language_id)
+
+        prompt = f"""你是静态代码审查工具。只输出 JSON 数组；禁止 Markdown、解释、前缀与代码围栏。
+
+规则：
+1) JSON 数组元素字段：category（小写 security|performance|refactor|style|syntax）、line（整数，未知为0）、message（单行建议）。
+2) 勿虚构行号；无法指向具体行则用 line=0。
+3) 不重复 Linter 原句时可补充根因/fix 方向。
+4) 仅报告在当前代码中能成立的问题；若没有则输出 []。
+
+语言: {language_id}
+文件: {file_path}
+该语言侧重点: {focus}
+
+解析/语法摘要: {syntax_str}
+Linter: {lint_str}
+{retrieval_context}
+上下文: {context_summary}
+
+Few-shot（形态必须一致）:
+{few_shot}
+
+代码:
+{code_body}
+"""
+
+        raw = llm.invoke(prompt)
+        raw_txt = _ensure_text(raw)
+        items = parse_ai_response(raw_txt)
+        return AiAnalysisResult(summary="AI JSON 审查完成", items=items, raw=raw_txt)
+    except Exception as e:
+        print(f"AI call failed: {e}")
+        return None
+
+
+def _ensure_text(raw: Any) -> str:
+    """LangChain/OpenAI 兼容：AIMessage.content 可能是 str。"""
+    if isinstance(raw, str):
+        return raw
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return content
+    return str(raw)
 
 
 def merge_items(*lists) -> list[MergedReviewItem]:
@@ -429,7 +525,6 @@ def merge_items(*lists) -> list[MergedReviewItem]:
             if key not in seen:
                 seen[key] = True
                 result.append(item)
-    # no priority sort for simplicity
     return result
 
 
@@ -469,22 +564,14 @@ def ai_items_to_merged(ai_items: list[AiSuggestionItem], prefix: str) -> list[Me
 
 
 def reflect_on_review(language_id: str, code: str, base_items: list[MergedReviewItem], round_index: int) -> Optional[list[MergedReviewItem]]:
-    """单轮反思：让AI评估当前审查结果并补充/修正建议"""
+    """单轮反思：补充 JSON 建议；低温 + 短文以降低漂移。"""
     try:
-        llm = OpenAI(
-            openai_api_base="http://localhost:11434/v1",
-            openai_api_key="not-needed",
-            model_name="codellama:7b-instruct",
-            temperature=0.3,
-            max_tokens=2048
-        )
-
-        review_summary = "\n".join([f"[{item.category.upper()}] {item.message}" for item in base_items[:80]])
-
-        prompt = render_self_review_prompt(language_id, code, review_summary, round_index)
+        llm = _llm(low_temp=0.06, max_tokens=768)
+        review_summary = "\n".join([f"[{item.category.upper()} L{item.line}] {item.message}" for item in base_items[:60]])
+        prompt = render_self_review_prompt(language_id, code[:MAX_CODE_CHARS_MAIN_REVIEW], review_summary, round_index)
 
         raw = llm.invoke(prompt)
-        items = parse_ai_response(raw)
+        items = parse_ai_response(_ensure_text(raw))
         return ai_items_to_merged(items, f'reflected-r{round_index}')
     except Exception as e:
         print(f"Reflection failed: {e}")
@@ -507,7 +594,7 @@ def produce_review(input: AgentReviewInput) -> FileReviewResult:
         security, performance, refactor, ai_items
     )
 
-    # 最多 3 轮自我审查
+    # 自我审查（轮次由环境变量控制，默认 1）
     merged = initial_items
     reflection_total = 0
     for round_index in range(1, SELF_REVIEW_MAX_ROUNDS + 1):
@@ -526,7 +613,9 @@ def produce_review(input: AgentReviewInput) -> FileReviewResult:
             break
 
     if ai_result:
-        ai_result.summary = f"{ai_result.summary} (few-shot + 自我审查{SELF_REVIEW_MAX_ROUNDS}轮, 新增{reflection_total}项)"
+        ai_result.summary = (
+            f"{ai_result.summary}（自我审查最多{SELF_REVIEW_MAX_ROUNDS}轮，新增{reflection_total}项）"
+        )
     
     result = FileReviewResult(
         uri=f'file://{input.filePath}', filePath=input.filePath, contentHash=ir.contentHash,
@@ -537,87 +626,223 @@ def produce_review(input: AgentReviewInput) -> FileReviewResult:
     print(f'agent processed in {elapsed:.1f}ms')
     return result
 
+
+
 def produce_fix(input: AgentReviewInput) -> dict:
-    """生成修复后的代码"""
+    """生成修复代码：若请求体含 issues，则跳过重复审查以提速。"""
     start = time.time()
-    
-    # 首先进行审查，获取问题列表
-    review_result = produce_review(input)
-    
-    # 构建修复提示
-    issues = []
-    for item in review_result.mergedItems:
-        issues.append({
-            'category': item.category,
-            'message': item.message,
-            'line': item.line,
-            'severity': item.severity
-        })
-    
-    # 调用AI生成修复代码
-    fixed_code = call_ai_fix(input.languageId, input.filePath, input.code, issues)
-    
-    elapsed = (time.time()-start)*1000
-    
+    detected_language = resolve_language(input.languageId, input.filePath, input.code)
+
+    if input.issues and len(input.issues) > 0:
+        issues: list[dict[str, Any]] = [
+            {
+                "category": it.category or "style",
+                "message": it.message or "",
+                "line": int(it.line or 0),
+                "severity": it.severity or "warning",
+            }
+            for it in input.issues
+        ]
+    else:
+        review_result = produce_review(input)
+        issues = [
+            {
+                "category": item.category,
+                "message": item.message,
+                "line": item.line,
+                "severity": item.severity,
+            }
+            for item in review_result.mergedItems
+        ]
+
+    fixed_code, fix_meta = call_ai_fix(detected_language, input.filePath, input.code, issues)
+    elapsed = (time.time() - start) * 1000
     return {
-        'fixed_code': fixed_code,
-        'issues': issues,
-        'execution_time': {
-            'total': elapsed
-        }
+        "fixed_code": fixed_code,
+        "issues": issues,
+        "fix_meta": fix_meta,
+        "execution_time": {"total": elapsed},
     }
 
-def call_ai_fix(language_id: str, file_path: str, code: str, issues: list) -> str:
-    """调用AI生成修复代码"""
+
+def _fence_tag(language_id: str) -> str:
+    return {
+        "python": "python",
+        "javascript": "javascript",
+        "typescript": "typescript",
+        "java": "java",
+    }.get(language_id, "text")
+
+
+def _extract_code_from_llm(text: Any, language_id: str) -> str:
+    s = text if isinstance(text, str) else str(text)
+    tag = _fence_tag(language_id)
+    patterns = [
+        rf"```{tag}\s*([\s\S]*?)```",
+        r"```(?:py|python|javascript|typescript|tsx|jsx|java)\s*([\s\S]*?)```",
+        r"```\s*([\s\S]*?)```",
+    ]
+    for p in patterns:
+        m = re.search(p, s, re.IGNORECASE | re.DOTALL)
+        if m:
+            body = m.group(1).strip()
+            if len(body) >= 8:
+                return body
+    return s.strip()
+
+
+def _python_compiles(snippet: str) -> bool:
     try:
-        # 配置LLM
-        llm = OpenAI(
-            openai_api_base="http://localhost:11434/v1",
-            openai_api_key="not-needed",
-            model_name="codellama:7b-instruct",
-            temperature=0.7,
-            max_tokens=4096
-        )
-        
-        # 构建问题描述
-        issues_description = "\n".join([f"- [{item['category']}] {item['message']} (第{item['line']}行)" for item in issues])
-        
-        # 构建修复提示
-        prompt = f"""
-        你是一个专业的代码修复助手，需要根据以下问题列表修复代码：
-        
-        语言: {language_id}
-        文件路径: {file_path}
-        
-        问题列表:
-        {issues_description}
-        
-        原始代码:
-        {code}
-        
-        请生成修复后的完整代码，确保：
-        1. 修复所有列出的问题
-        2. 保持代码的原始功能不变
-        3. 代码风格一致
-        4. 修复后的代码应该可以直接运行
-        
-        只返回修复后的完整代码，不要包含任何其他说明。
-        """
-        
-        # 调用模型
-        raw = llm.invoke(prompt)
-        
-        # 提取修复后的代码
-        # 尝试从响应中提取代码块
-        import re
-        code_match = re.search(r'```[a-zA-Z0-9]*\n(.*?)```', raw, re.DOTALL)
-        if code_match:
-            return code_match.group(1).strip()
-        else:
-            # 如果没有代码块，返回整个响应
-            return raw.strip()
-            
-    except Exception as e:
-        print(f"AI fix call failed: {e}")
-        # 失败时返回原始代码
-        return code
+        compile(snippet, "<fixed>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _fix_plausible(orig: str, fixed: str) -> tuple[bool, str]:
+    o, f = orig.strip(), fixed.strip()
+    if not f:
+        return False, "empty"
+    if len(o) > 48 and len(f) < len(o) * 0.22:
+        return False, "too_short_vs_original"
+    ratio = len(f) / max(len(o), 1)
+    if ratio > 4.5 and len(o) > 400:
+        return False, "likely_truncated_or_verbose"
+    return True, ""
+
+
+def _severity_key(issue: dict) -> tuple:
+    s = str(issue.get("severity") or "info").lower()
+    sr = {"error": 0, "warning": 1, "info": 2}.get(s, 2)
+    cat = issue.get("category") or ""
+    ck = {"security": 0, "syntax": 1, "performance": 2, "refactor": 3, "style": 4}.get(cat, 5)
+    return sr, ck
+
+
+def apply_deterministic_fixes(code: str, language_id: str, issues: list[dict]) -> tuple[str, list[str]]:
+    """模型不可靠时的保守改写（注释/占位/明显替换）。"""
+    notes: list[str] = []
+    lines = code.splitlines()
+    per_line: dict[int, str] = {}
+    for it in issues:
+        try:
+            ln = int(it.get("line") or 0)
+        except Exception:
+            ln = 0
+        if ln < 1:
+            continue
+        per_line[ln] = per_line.get(ln, "") + " " + str(it.get("message") or "")
+
+    for lineno in sorted(per_line.keys(), reverse=True):
+        if lineno > len(lines):
+            continue
+        msg_l = per_line[lineno].lower()
+        line = lines[lineno - 1]
+
+        if language_id == "python":
+            if ("eval" in msg_l or "eval(" in line) and "literal_eval" not in line and "eval(" in line:
+                lines[lineno - 1] = re.sub(r"\beval\s*\(", "ast.literal_eval(", line, count=1)
+                notes.append(f"L{lineno}: eval→literal_eval（仅适用于可信字面量）")
+        elif language_id in {"javascript", "typescript"}:
+            if "eval(" in line and not line.strip().startswith("//"):
+                lines[lineno - 1] = "// FIXME: avoid eval — replace with safe API\n" + line
+                notes.append(f"L{lineno}: 标注 eval")
+        elif language_id == "java":
+            if "preparedstatement" in msg_l or "注入" in msg_l or ("sql" in msg_l and "+" in line):
+                if "// TODO: use PreparedStatement" not in line:
+                    indent = re.match(r"^(\s*)", line)
+                    ind = indent.group(1) if indent else ""
+                    lines[lineno - 1] = ind + "// TODO: use PreparedStatement + bound parameters\n" + line
+                    notes.append(f"L{lineno}: SQL 占位注释")
+
+    out = "\n".join(lines)
+    if language_id == "python" and "literal_eval(" in out and not re.search(r"^(\s*)import\s+ast\b", out, re.MULTILINE):
+        out = "import ast\n\n" + out
+        notes.append("inserted import ast")
+    return out, notes
+
+
+def _build_fix_prompt(language_id: str, file_path: str, orig: str, issues_block: str, reminder: str) -> str:
+    tag = _fence_tag(language_id)
+    fence = "```"
+    nl = "\n"
+    return (
+        "你是源代码修复引擎。输出必须能被正则直接提取。\n\n"
+        "硬性要求：\n"
+        f"1) 第一行必须为：{fence}{tag}\n"
+        "2) 接着输出修正后的完整源文件正文（不要用「省略」占位整段删除）\n"
+        "3) 最后一行必须为：单独一行闭合围栏（三个反引号）\n"
+        "4) 围栏之外禁止任何其它字符。\n"
+        f"5) 语言 {language_id}；保持语义、入口签名与导出不变。\n"
+        f"{reminder}\n\n"
+        f"待处理问题：\n{issues_block}\n\n"
+        f"文件路径: {file_path}\n\n--- ORIGINAL ---{nl}{orig}{nl}"
+    )
+
+
+def call_ai_fix(language_id: str, file_path: str, code: str, issues: list) -> tuple[str, dict[str, Any]]:
+    meta: dict[str, Any] = {"attempts": [], "validated": False, "deterministic_notes": []}
+    if not issues:
+        return code, meta
+
+    sorted_issues = sorted([dict(i) for i in issues], key=_severity_key)[:40]
+    issues_block = "\n".join(
+        f"- [{i.get('category')}] sev={i.get('severity')} L{i.get('line')} :: {i.get('message')}"
+        for i in sorted_issues
+    )
+    orig = code[:80000]
+
+    prompts = (
+        _build_fix_prompt(language_id, file_path, orig, issues_block, ""),
+        _build_fix_prompt(
+            language_id,
+            file_path,
+            orig,
+            issues_block,
+            reminder="上一轮若失败：严守单围栏输出；仍需完整文件。"
+        ),
+    )
+
+    llm = _llm(low_temp=0.12, max_tokens=min(6144, int(os.environ.get("REVIEW_AGENT_MAX_FIX_TOKENS", "6144"))))
+
+    best = ""
+    for i, prompt in enumerate(prompts, start=1):
+        try:
+            raw = llm.invoke(prompt)
+            candidate = _extract_code_from_llm(_ensure_text(raw), language_id)
+            ok, why = _fix_plausible(orig, candidate)
+            py_ok = language_id != "python" or _python_compiles(candidate)
+            meta["attempts"].append({"n": i, "plausible": ok, "reason": why, "python_ok": py_ok})
+
+            if ok and py_ok:
+                meta["validated"] = True
+                best = candidate
+                break
+            if not best:
+                best = candidate
+            elif (
+                language_id == "python"
+                and py_ok
+                and (not best or not _python_compiles(best))
+            ):
+                best = candidate
+        except Exception as e:
+            meta["attempts"].append({"n": i, "error": str(e)})
+
+    if not best:
+        det, notes = apply_deterministic_fixes(orig, language_id, sorted_issues)
+        meta["deterministic_notes"] = notes
+        return det if det != orig else orig, meta
+
+    if meta["validated"]:
+        return best, meta
+
+    det_overlay, overlay_notes = apply_deterministic_fixes(best, language_id, sorted_issues)
+    meta["deterministic_notes"].extend(overlay_notes)
+
+    if language_id == "python" and not _python_compiles(best):
+        det_orig, n2 = apply_deterministic_fixes(orig, language_id, sorted_issues)
+        meta["deterministic_notes"].extend(n2)
+        return det_orig if det_orig != orig else best, meta
+
+    return det_overlay, meta
